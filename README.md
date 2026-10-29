@@ -68,7 +68,7 @@ Supporting open-source developers helps ensure continued maintenance and improve
 
 - Play and organize your music collection
 - Support for WAV, FLAC, Ogg FLAC, WavPack, Ogg Vorbis, Opus, Ogg Speex, MPC, TrueAudio, AIFF, MP4/AAC, ALAC, MP3, ASF, Monkey’s Audio, and DSD (DSF/DSDIFF)
-- Bit-perfect playback on Linux
+- Bit-perfect playback and automatic native DSF output on Linux ([setup](NATIVE_DSD.md))
 - MPRIS2 / D-Bus remote control on Linux
 - Native desktop notifications
 - Advanced playlist management

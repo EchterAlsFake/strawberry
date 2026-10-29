@@ -106,6 +106,14 @@ BackendSettingsPage::BackendSettingsPage(SettingsDialog *dialog, const SharedPtr
   QObject::connect(ui_->checkbox_fadeout_stop, &QCheckBox::toggled, this, &BackendSettingsPage::FadingOptionsChanged);
   QObject::connect(ui_->checkbox_fadeout_cross, &QCheckBox::toggled, this, &BackendSettingsPage::FadingOptionsChanged);
   QObject::connect(ui_->checkbox_fadeout_auto, &QCheckBox::toggled, this, &BackendSettingsPage::FadingOptionsChanged);
+  QObject::connect(ui_->checkbox_bit_perfect, &QCheckBox::toggled, this, [this](const bool enabled) {
+    ui_->checkbox_volume_control->setEnabled(!enabled);
+    ui_->checkbox_volume_exponential->setEnabled(!enabled);
+    ui_->widget_channels_enabled->setEnabled(!enabled);
+    ui_->checkbox_bs2b->setEnabled(!enabled);
+    ui_->groupbox_audio_normalization->setEnabled(!enabled);
+    FadingOptionsChanged();
+  });
   QObject::connect(ui_->checkbox_channels, &QCheckBox::toggled, ui_->widget_channels, &QSpinBox::setEnabled);
   QObject::connect(ui_->button_buffer_defaults, &QPushButton::clicked, this, &BackendSettingsPage::BufferDefaults);
 
@@ -171,6 +179,8 @@ void BackendSettingsPage::Load() {
   Load_Output(output_current_, device_current_);
 
   ui_->checkbox_volume_control->setChecked(s.value(kVolumeControl, kDefaultVolumeControl).toBool());
+  ui_->checkbox_bit_perfect->setChecked(s.value(kBitPerfect, kDefaultBitPerfect).toBool());
+  ui_->checkbox_native_dsd->setChecked(s.value(kNativeDSD, kDefaultNativeDSD).toBool());
   ui_->checkbox_volume_exponential->setChecked(s.value(kVolumeExponential, kDefaultVolumeExponential).toBool());
 
   ui_->checkbox_channels->setChecked(s.value(kChannelsEnabled, kDefaultChannelsEnabled).toBool());
@@ -432,6 +442,8 @@ void BackendSettingsPage::Save() {
 #endif
 
   s.setValue(kVolumeControl, ui_->checkbox_volume_control->isChecked());
+  s.setValue(kBitPerfect, ui_->checkbox_bit_perfect->isChecked());
+  s.setValue(kNativeDSD, ui_->checkbox_native_dsd->isChecked());
   s.setValue(kVolumeExponential, ui_->checkbox_volume_exponential->isChecked());
 
   s.setValue(kChannelsEnabled, ui_->checkbox_channels->isChecked());
@@ -747,7 +759,7 @@ void BackendSettingsPage::FadingOptionsChanged() {
   EngineBase::OutputDetails output = ui_->combobox_output->itemData(ui_->combobox_output->currentIndex()).value<EngineBase::OutputDetails>();
   const bool fading_supported = player_->engine()->FadingSupport(output.name);
   const bool alsa_hw = player_->engine()->ALSADeviceSupport(output.name) && !ui_->lineedit_device->text().isEmpty() && (ui_->lineedit_device->text().contains(kRegex_ALSA_HW) || ui_->lineedit_device->text().contains(kRegex_ALSA_PlugHW));
-  if (fading_supported && !alsa_hw) {
+  if (fading_supported && !alsa_hw && !ui_->checkbox_bit_perfect->isChecked()) {
     ui_->groupbox_fading->setEnabled(true);
   }
   else {

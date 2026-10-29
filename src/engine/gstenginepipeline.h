@@ -74,6 +74,8 @@ class GstEnginePipeline : public QObject {
   void set_playbin3_enabled(const bool playbin3_enabled);
   void set_exclusive_mode(const bool exclusive_mode);
   void set_volume_enabled(const bool enabled);
+  void set_bit_perfect(const bool enabled) { bit_perfect_ = enabled; }
+  void set_native_dsd_enabled(const bool enabled) { native_dsd_enabled_ = enabled; }
   void set_volume_exponential(const bool enabled);
   void set_stereo_balancer_enabled(const bool enabled);
   void set_equalizer_enabled(const bool enabled);
@@ -178,6 +180,10 @@ class GstEnginePipeline : public QObject {
   bool IsStateNull() const;
   bool StateChangeInProgress();
   bool InitAudioBin(QString &error);
+  bool InitDirectAudioBin(QString &error);
+  bool UsesNativeDsd(const QUrl &url) const;
+  static void DsdElementAddedCallback(GstBin *bin, GstBin *sub_bin, GstElement *element, gpointer self);
+  static GstPadProbeReturn DirectAudioProbeCallback(GstPad *pad, GstPadProbeInfo *info, gpointer self);
   void SetupVolume(GstElement *element);
   void ReapplyVolume();
   void ReapplyMute();
@@ -262,6 +268,9 @@ class GstEnginePipeline : public QObject {
   QVariant device_;
   bool exclusive_mode_;
   bool volume_enabled_;
+  bool bit_perfect_;
+  bool native_dsd_enabled_;
+  bool native_dsd_;
   bool volume_exponential_;
   bool fading_enabled_;
   std::atomic<bool> strict_ssl_enabled_;
@@ -415,6 +424,7 @@ class GstEnginePipeline : public QObject {
   GstElement *audiobin_;
   GstElement *audiosink_;
   GstElement *audioqueue_;
+  GstElement *direct_capsfilter_;
   GstElement *volume_;
   GstElement *volume_sw_;
   GstElement *volume_fading_;
@@ -429,6 +439,7 @@ class GstEnginePipeline : public QObject {
   std::optional<gulong> buffer_probe_cb_id_;
   std::optional<gulong> pad_probe_cb_id_;
   std::optional<gulong> element_added_cb_id_;
+  std::optional<gulong> dsd_element_added_cb_id_;
   std::optional<gulong> element_removed_cb_id_;
   std::optional<gulong> pad_added_cb_id_;
   std::optional<gulong> notify_source_cb_id_;

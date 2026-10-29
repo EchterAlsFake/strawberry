@@ -196,6 +196,26 @@
      </property>
      <layout class="QVBoxLayout" name="verticalLayout_2">
       <item>
+       <widget class="QCheckBox" name="checkbox_bit_perfect">
+        <property name="toolTip">
+         <string>Requires ALSA output with a direct hw: device. Bypasses software volume, balance, equalizer, ReplayGain, loudness normalization, crossfeed and fades. Preserves the source sample rate, channel count and integer PCM precision; unsupported formats fail instead of being resampled. Control listening volume on your DAC.</string>
+        </property>
+        <property name="text">
+         <string>Bit-perfect output (ALSA hardware)</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="checkbox_native_dsd">
+        <property name="toolTip">
+         <string>Automatically send DSF files as native DSD when using ALSA output with a direct hw: device. Requires a DSD-capable DAC and GStreamer with native DSD support (dsdconvert, avdemux_dsf and alsasink). Audio processing and software volume are bypassed for DSD. PCM tracks remain PCM. Disable this option to decode DSF files to PCM.</string>
+        </property>
+        <property name="text">
+         <string>Automatic native DSD for DSF files (ALSA hardware)</string>
+        </property>
+       </widget>
+      </item>
+      <item>
        <widget class="QCheckBox" name="checkbox_volume_control">
         <property name="text">
          <string>Enable volume control</string>
@@ -925,6 +945,8 @@
   <tabstop>radiobutton_alsa_plughw</tabstop>
   <tabstop>radiobutton_alsa_pcm</tabstop>
   <tabstop>checkbox_exclusive_mode</tabstop>
+  <tabstop>checkbox_bit_perfect</tabstop>
+  <tabstop>checkbox_native_dsd</tabstop>
   <tabstop>checkbox_volume_control</tabstop>
   <tabstop>checkbox_volume_exponential</tabstop>
   <tabstop>checkbox_channels</tabstop>

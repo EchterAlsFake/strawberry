@@ -50,6 +50,8 @@ EngineBase::EngineBase(QObject *parent)
       playbin3_enabled_(true),
       exclusive_mode_(false),
       volume_control_(true),
+      bit_perfect_(BackendSettings::kDefaultBitPerfect),
+      native_dsd_(BackendSettings::kDefaultNativeDSD),
       volume_exponential_(false),
       volume_(100),
       muted_(false),
@@ -193,6 +195,8 @@ void EngineBase::ReloadSettings() {
   exclusive_mode_ = s.value(BackendSettings::kExclusiveMode, BackendSettings::kDefaultExclusiveMode).toBool();
 
   volume_control_ = s.value(BackendSettings::kVolumeControl, BackendSettings::kDefaultVolumeControl).toBool();
+  bit_perfect_ = s.value(BackendSettings::kBitPerfect, BackendSettings::kDefaultBitPerfect).toBool();
+  native_dsd_ = s.value(BackendSettings::kNativeDSD, BackendSettings::kDefaultNativeDSD).toBool();
   volume_exponential_ = s.value(BackendSettings::kVolumeExponential, BackendSettings::kDefaultVolumeExponential).toBool();
 
   channels_enabled_ = s.value(BackendSettings::kChannelsEnabled, BackendSettings::kDefaultChannelsEnabled).toBool();

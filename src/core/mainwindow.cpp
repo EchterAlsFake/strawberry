@@ -1314,7 +1314,8 @@ void MainWindow::ReloadSettings() {
   ui_->button_love->setIconSize(QSize(iconsize, iconsize));
 
   s.beginGroup(BackendSettings::kSettingsGroup);
-  bool volume_control = s.value(BackendSettings::kVolumeControl, BackendSettings::kDefaultVolumeControl).toBool();
+  const bool volume_control = s.value(BackendSettings::kVolumeControl, BackendSettings::kDefaultVolumeControl).toBool() &&
+                              !s.value(BackendSettings::kBitPerfect, BackendSettings::kDefaultBitPerfect).toBool();
   s.endGroup();
   if (volume_control != ui_->volume->isEnabled()) {
     ui_->volume->SetEnabled(volume_control);

@@ -141,7 +141,7 @@ class EngineBase : public QObject {
 
  public:
   // Simple accessors
-  bool volume_control() const { return volume_control_; }
+  bool volume_control() const { return volume_control_ && !bit_perfect_; }
   bool volume_exponential() const { return volume_exponential_; }
   inline uint volume() const { return volume_; }
   inline bool is_muted() const { return muted_; }
@@ -198,6 +198,8 @@ class EngineBase : public QObject {
   bool playbin3_enabled_;
   bool exclusive_mode_;
   bool volume_control_;
+  bool bit_perfect_;
+  bool native_dsd_;
   bool volume_exponential_;
   uint volume_;
   bool muted_;

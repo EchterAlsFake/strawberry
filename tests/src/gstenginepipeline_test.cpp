@@ -20,6 +20,7 @@
 #include "config.h"
 
 #include <gst/gst.h>
+#include <gst/app/gstappsink.h>
 
 #include <QtGlobal>
 
@@ -38,6 +39,8 @@
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QTemporaryDir>
+#include <QDataStream>
 
 #include "engine/gststartup.h"
 #include "engine/gstenginepipeline.h"
@@ -49,6 +52,33 @@ using namespace Qt::Literals::StringLiterals;
 // Declared at file scope so that GstEnginePipeline's "friend class GstEnginePipelineTest;" resolves to this class.
 class GstEnginePipelineTest {
  public:
+  static bool IsNativeDsd(const GstEnginePipeline &pipeline) { return pipeline.native_dsd_; }
+
+  static bool HasProcessing(const GstEnginePipeline &pipeline) {
+    return pipeline.volume_ || pipeline.volume_sw_ || pipeline.volume_fading_ || pipeline.volume_ebur128_ || pipeline.audiopanorama_ || pipeline.equalizer_;
+  }
+
+  // Substitute a capture sink after construction, before opening any real audio device.
+  static GstElement *CaptureOutput(GstEnginePipeline &pipeline, const char *caps_string) {
+    GstElement *sink = gst_element_factory_make("appsink", nullptr);
+    if (!sink) return nullptr;
+    GstCaps *caps = gst_caps_from_string(caps_string);
+    g_object_set(G_OBJECT(sink), "caps", caps, "sync", FALSE, "wait-on-eos", FALSE, nullptr);
+    gst_caps_unref(caps);
+    GstPad *old_pad = gst_element_get_static_pad(pipeline.audiosink_, "sink");
+    GstPad *peer = gst_pad_get_peer(old_pad);
+    gst_pad_unlink(peer, old_pad);
+    gst_object_unref(old_pad);
+    gst_bin_remove(GST_BIN(pipeline.audiobin_), pipeline.audiosink_);
+    gst_bin_add(GST_BIN(pipeline.audiobin_), sink);
+    GstPad *new_pad = gst_element_get_static_pad(sink, "sink");
+    const GstPadLinkReturn result = gst_pad_link(peer, new_pad);
+    gst_object_unref(new_pad);
+    gst_object_unref(peer);
+    pipeline.audiosink_ = sink;
+    return result == GST_PAD_LINK_OK ? sink : nullptr;
+  }
+
   // Waits until the GStreamer pipeline itself is in the state, without processing the bus messages, so the cached state in the GstEnginePipeline is not updated.
   static bool WaitForPipelineState(GstEnginePipeline &pipeline, const GstState state, const int timeout_msec = 10000) {
     QElapsedTimer timer;
@@ -109,6 +139,293 @@ void ProcessEventsFor(const int duration_msec) {
     ProcessEvents();
   }
 }
+
+#ifdef HAVE_ALSA
+
+// A short, deterministic stereo DSF with planar 4096-byte blocks.
+bool WriteDsf(const QString &path, const int bits_per_sample, QByteArray &expected) {
+  QFile file(path);
+  if (!file.open(QIODevice::WriteOnly)) return false;
+  constexpr int blocks = 3;
+  constexpr int block_size = 4096;
+  constexpr int bytes_per_channel = blocks * block_size;
+  QDataStream stream(&file);
+  stream.setByteOrder(QDataStream::LittleEndian);
+  stream.writeRawData("DSD ", 4);
+  stream << quint64(28) << quint64(28 + 52 + 12 + 2 * bytes_per_channel) << quint64(0);
+  stream.writeRawData("fmt ", 4);
+  stream << quint64(52) << quint32(1) << quint32(0) << quint32(2) << quint32(2)
+         << quint32(2822400) << quint32(bits_per_sample) << quint64(bytes_per_channel * 8) << quint32(block_size) << quint32(0);
+  stream.writeRawData("data", 4);
+  stream << quint64(12 + 2 * bytes_per_channel);
+
+  auto source_byte = [](const int channel, const int index) { return static_cast<unsigned char>((index * 29 + channel * 103) & 255); };
+  auto reverse_bits = [](unsigned char value) {
+    unsigned char result = 0;
+    for (int bit = 0; bit < 8; ++bit) {
+      result = static_cast<unsigned char>((result << 1) | (value & 1));
+      value >>= 1;
+    }
+    return result;
+  };
+  for (int block = 0; block < blocks; ++block) {
+    for (int channel = 0; channel < 2; ++channel) {
+      for (int i = 0; i < block_size; ++i) stream << quint8(source_byte(channel, block * block_size + i));
+    }
+  }
+  // DSD_U32_BE packs four consecutive time-ordered bytes of each channel into each word.
+  for (int i = 0; i < bytes_per_channel; i += 4) {
+    for (int channel = 0; channel < 2; ++channel) {
+      for (int byte = 0; byte < 4; ++byte) {
+        const unsigned char value = source_byte(channel, i + byte);
+        expected.append(static_cast<char>(bits_per_sample == 1 ? reverse_bits(value) : value));
+      }
+    }
+  }
+  return stream.status() == QDataStream::Ok;
+}
+
+QByteArray CapturedAudio(GstElement *sink) {
+  QByteArray result;
+  while (GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 0)) {
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstMapInfo map;
+    if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+      result.append(reinterpret_cast<const char*>(map.data), static_cast<qsizetype>(map.size));
+      gst_buffer_unmap(buffer, &map);
+    }
+    gst_sample_unref(sample);
+  }
+  return result;
+}
+
+TEST(GstEnginePipelineTest, NativeDsfPreservesEveryBitWithBothPlaybins) {
+
+  GstStartup::Initialize();
+  if (!gst_registry_check_feature_version(gst_registry_get(), "dsdconvert", 1, 24, 0) ||
+      !gst_registry_check_feature_version(gst_registry_get(), "alsasink", 1, 24, 0) ||
+      !gst_registry_check_feature_version(gst_registry_get(), "avdemux_dsf", 1, 24, 0)) {
+    GTEST_SKIP() << "GStreamer native DSD plugins are not installed";
+  }
+
+  for (const bool playbin3 : {false, true}) {
+    for (const int bits_per_sample : {1, 8}) {
+      SCOPED_TRACE(::testing::Message() << "playbin3=" << playbin3 << " DSF bit order=" << bits_per_sample);
+      QTemporaryDir directory;
+      const QUrl url = QUrl::fromLocalFile(directory.filePath(u"native.DSF"_s));
+      QByteArray expected;
+      ASSERT_TRUE(WriteDsf(url.toLocalFile(), bits_per_sample, expected));
+      GstEnginePipeline pipeline;
+      pipeline.set_output_device(u"alsasink"_s, u"hw:CARD=Pro,DEV=0"_s);
+      pipeline.set_playbin3_enabled(playbin3);
+      pipeline.set_device_warmup_duration_ms(0);
+      // All processing options must be bypassed for native DSD.
+      pipeline.set_fading_enabled(true);
+      pipeline.set_equalizer_enabled(true);
+      pipeline.set_stereo_balancer_enabled(true);
+      pipeline.set_replaygain(true, 0, 6.0, 6.0, true);
+      pipeline.set_ebur128_loudness_normalization(true);
+      pipeline.set_channels(true, 1);
+      pipeline.set_bs2b_enabled(true);
+      QString error;
+      ASSERT_TRUE(pipeline.InitFromUrl(url, url, url.toEncoded(), 0, 0, 0.0, error)) << error.toStdString();
+      ASSERT_TRUE(GstEnginePipelineTest::IsNativeDsd(pipeline));
+      EXPECT_TRUE(pipeline.exclusive_mode());
+      EXPECT_FALSE(GstEnginePipelineTest::HasProcessing(pipeline));
+      GstElement *sink = GstEnginePipelineTest::CaptureOutput(pipeline, "audio/x-dsd,format=DSDU32BE,layout=interleaved,reversed-bytes=false,rate=352800,channels=2");
+      ASSERT_NE(nullptr, sink);
+      bool ended = false;
+      QObject::connect(&pipeline, &GstEnginePipeline::EndOfStreamReached, &pipeline, [&ended]() { ended = true; });
+      QObject::connect(&pipeline, &GstEnginePipeline::Error, &pipeline, [&error](int, int, int, const QString &message, const QString &) { error = message; });
+      pipeline.SetVolume(1);
+      pipeline.SetMute(true);
+      pipeline.Play(false, 0);
+      ASSERT_TRUE(WaitFor([&]() { return ended || !error.isEmpty(); })) << "Timed out playing DSF";
+      ASSERT_TRUE(error.isEmpty()) << error.toStdString();
+      const QByteArray actual = CapturedAudio(sink);
+      ASSERT_EQ(expected.size(), actual.size());
+      EXPECT_TRUE(expected == actual) << "Native DSD bits changed";
+    }
+  }
+
+}
+
+TEST(GstEnginePipelineTest, NativeDsfRequiresDirectAlsaAndCanBeDisabled) {
+
+  GstStartup::Initialize();
+  const QUrl url = QUrl::fromLocalFile(u"/tmp/test.dsf"_s);
+  for (const QString &output : {u"fakesink"_s, u"alsasink"_s}) {
+    GstEnginePipeline pipeline;
+    pipeline.set_output_device(output, output == u"alsasink"_s ? QVariant(u"plughw:0,0"_s) : QVariant());
+    QString error;
+    ASSERT_TRUE(pipeline.InitFromUrl(url, url, url.toEncoded(), 0, 0, 0.0, error)) << error.toStdString();
+    EXPECT_FALSE(GstEnginePipelineTest::IsNativeDsd(pipeline));
+  }
+  GstEnginePipeline pipeline;
+  pipeline.set_output_device(u"alsasink"_s, u"hw:Pro,0"_s);
+  pipeline.set_native_dsd_enabled(false);
+  QString error;
+  ASSERT_TRUE(pipeline.InitFromUrl(url, url, url.toEncoded(), 0, 0, 0.0, error));
+  EXPECT_FALSE(GstEnginePipelineTest::IsNativeDsd(pipeline));
+
+}
+
+TEST(GstEnginePipelineTest, PcmDsdBoundariesDoNotReuseTheAudioBin) {
+
+  GstStartup::Initialize();
+  if (!gst_registry_check_feature_version(gst_registry_get(), "dsdconvert", 1, 24, 0) ||
+      !gst_registry_check_feature_version(gst_registry_get(), "alsasink", 1, 24, 0)) {
+    GTEST_SKIP() << "GStreamer native DSD plugins are not installed";
+  }
+  const QUrl pcm = QUrl::fromLocalFile(u"/tmp/test.flac"_s);
+  const QUrl dsd = QUrl::fromLocalFile(u"/tmp/test.dsf"_s);
+  for (const bool native : {false, true}) {
+    const QUrl current = native ? dsd : pcm;
+    const QUrl next = native ? pcm : dsd;
+    GstEnginePipeline pipeline;
+    pipeline.set_output_device(u"alsasink"_s, u"hw:Pro,0"_s);
+    QString error;
+    ASSERT_TRUE(pipeline.InitFromUrl(current, current, current.toEncoded(), 0, 0, 0.0, error)) << error.toStdString();
+    pipeline.PrepareNextUrl(next, next, next.toEncoded(), 0, 0);
+    EXPECT_FALSE(pipeline.HasNextUrl());
+    pipeline.PrepareNextUrl(current, current, current.toEncoded(), 0, 0);
+    EXPECT_TRUE(pipeline.HasNextUrl());
+    pipeline.PrepareNextUrl(next, next, next.toEncoded(), 0, 0);
+    EXPECT_FALSE(pipeline.HasNextUrl());
+  }
+
+}
+
+TEST(GstEnginePipelineTest, BitPerfectOutputRejectsMixingDevices) {
+
+  GstStartup::Initialize();
+  GstEnginePipeline pipeline;
+  pipeline.set_output_device(u"fakesink"_s, QVariant());
+  pipeline.set_bit_perfect(true);
+  const QUrl url = QUrl::fromLocalFile(u"/tmp/test.wav"_s);
+  QString error;
+  EXPECT_FALSE(pipeline.InitFromUrl(url, url, url.toEncoded(), 0, 0, 0.0, error));
+  EXPECT_TRUE(error.contains("hw:"_L1));
+
+}
+
+TEST(GstEnginePipelineTest, BitPerfectPcmPreservesRateChannelsAndSamples) {
+
+  GstStartup::Initialize();
+  for (const int bits : {16, 24}) {
+    for (const bool playbin3 : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << "PCM bits=" << bits << " playbin3=" << playbin3);
+      QTemporaryDir directory;
+      const QUrl url = QUrl::fromLocalFile(directory.filePath(u"pcm.wav"_s));
+      QFile file(url.toLocalFile());
+      ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+      constexpr int frames = 4096;
+      constexpr int channels = 2;
+      const int data_size = frames * channels * bits / 8;
+      QDataStream stream(&file);
+      stream.setByteOrder(QDataStream::LittleEndian);
+      stream.writeRawData("RIFF", 4);
+      stream << quint32(36 + data_size);
+      stream.writeRawData("WAVEfmt ", 8);
+      stream << quint32(16) << quint16(1) << quint16(channels) << quint32(96000)
+             << quint32(96000 * channels * bits / 8) << quint16(channels * bits / 8) << quint16(bits);
+      stream.writeRawData("data", 4);
+      stream << quint32(data_size);
+      QByteArray expected;
+      QDataStream expected_stream(&expected, QIODevice::WriteOnly);
+      expected_stream.setByteOrder(QDataStream::LittleEndian);
+      for (int i = 0; i < frames * channels; ++i) {
+        const quint32 sample = static_cast<quint32>(i) * 4799U;
+        for (int byte = 0; byte < bits / 8; ++byte) stream << quint8((sample >> (8 * byte)) & 255U);
+        expected_stream << quint32(sample << (32 - bits));
+      }
+      file.close();
+
+      GstEnginePipeline pipeline;
+      pipeline.set_output_device(u"alsasink"_s, u"hw:Pro,0"_s);
+      pipeline.set_bit_perfect(true);
+      pipeline.set_playbin3_enabled(playbin3);
+      pipeline.set_device_warmup_duration_ms(0);
+      pipeline.set_equalizer_enabled(true);
+      pipeline.set_stereo_balancer_enabled(true);
+      pipeline.set_fading_enabled(true);
+      pipeline.set_replaygain(true, 0, 6.0, 6.0, true);
+      pipeline.set_ebur128_loudness_normalization(true);
+      pipeline.set_channels(true, 1);
+      pipeline.set_bs2b_enabled(true);
+      QString error;
+      ASSERT_TRUE(pipeline.InitFromUrl(url, url, url.toEncoded(), 0, 0, 12.0, error)) << error.toStdString();
+      EXPECT_FALSE(GstEnginePipelineTest::IsNativeDsd(pipeline));
+      EXPECT_FALSE(GstEnginePipelineTest::HasProcessing(pipeline));
+      EXPECT_TRUE(pipeline.exclusive_mode());
+      GstElement *sink = GstEnginePipelineTest::CaptureOutput(pipeline, "audio/x-raw,format=S32LE,rate=96000,channels=2,layout=interleaved");
+      ASSERT_NE(nullptr, sink);
+      bool ended = false;
+      QObject::connect(&pipeline, &GstEnginePipeline::EndOfStreamReached, &pipeline, [&ended]() { ended = true; });
+      QObject::connect(&pipeline, &GstEnginePipeline::Error, &pipeline, [&error](int, int, int, const QString &message, const QString &) { error = message; });
+      pipeline.SetVolume(1);
+      pipeline.SetMute(true);
+      pipeline.Play(false, 0);
+      ASSERT_TRUE(WaitFor([&]() { return ended || !error.isEmpty(); }));
+      ASSERT_TRUE(error.isEmpty()) << error.toStdString();
+      const QByteArray actual = CapturedAudio(sink);
+      ASSERT_EQ(expected.size(), actual.size());
+      EXPECT_TRUE(actual == expected) << "PCM samples changed during integer widening";
+    }
+  }
+
+}
+
+TEST(GstEnginePipelineTest, BitPerfectPcmRejectsResamplingMixingAndPrecisionLoss) {
+
+  GstStartup::Initialize();
+  TemporaryResource res(u":/audio/strawberry.wav"_s);
+  ASSERT_TRUE(res.open());
+  const QUrl url = QUrl::fromLocalFile(res.fileName());
+  for (const char *caps : {"audio/x-raw,format=S8", "audio/x-raw,rate=12345", "audio/x-raw,channels=7"}) {
+    SCOPED_TRACE(caps);
+    GstEnginePipeline pipeline;
+    pipeline.set_output_device(u"alsasink"_s, u"hw:Pro,0"_s);
+    pipeline.set_bit_perfect(true);
+    pipeline.set_device_warmup_duration_ms(0);
+    QString error;
+    ASSERT_TRUE(pipeline.InitFromUrl(url, url, url.toEncoded(), 0, 0, 0.0, error)) << error.toStdString();
+    ASSERT_NE(nullptr, GstEnginePipelineTest::CaptureOutput(pipeline, caps));
+    QObject::connect(&pipeline, &GstEnginePipeline::Error, &pipeline, [&error](int, int, int, const QString &message, const QString &) { error = message; });
+    pipeline.Play(false, 0);
+    EXPECT_TRUE(WaitFor([&]() { return !error.isEmpty(); })) << "Output silently changed the PCM format";
+    EXPECT_TRUE(error.contains("Bit-perfect"_L1)) << error.toStdString();
+  }
+
+}
+
+TEST(GstEnginePipelineTest, DisablingNativeDsdStillPlaysDsfAsPcm) {
+
+  GstStartup::Initialize();
+  QTemporaryDir directory;
+  const QUrl url = QUrl::fromLocalFile(directory.filePath(u"fallback.dsf"_s));
+  QByteArray expected;
+  ASSERT_TRUE(WriteDsf(url.toLocalFile(), 1, expected));
+  GstEnginePipeline pipeline;
+  pipeline.set_output_device(u"alsasink"_s, u"hw:Pro,0"_s);
+  pipeline.set_native_dsd_enabled(false);
+  pipeline.set_device_warmup_duration_ms(0);
+  QString error;
+  ASSERT_TRUE(pipeline.InitFromUrl(url, url, url.toEncoded(), 0, 0, 0.0, error)) << error.toStdString();
+  EXPECT_FALSE(GstEnginePipelineTest::IsNativeDsd(pipeline));
+  GstElement *sink = GstEnginePipelineTest::CaptureOutput(pipeline, "audio/x-raw");
+  ASSERT_NE(nullptr, sink);
+  bool ended = false;
+  QObject::connect(&pipeline, &GstEnginePipeline::EndOfStreamReached, &pipeline, [&ended]() { ended = true; });
+  QObject::connect(&pipeline, &GstEnginePipeline::Error, &pipeline, [&error](int, int, int, const QString &message, const QString &) { error = message; });
+  pipeline.Play(false, 0);
+  ASSERT_TRUE(WaitFor([&]() { return ended || !error.isEmpty(); }));
+  ASSERT_TRUE(error.isEmpty()) << error.toStdString();
+  EXPECT_FALSE(CapturedAudio(sink).isEmpty());
+
+}
+
+#endif  // HAVE_ALSA
 
 // Regression test: pausing while playback was waiting for the audio device warm-up was ignored, and the warm-up timer then started playback anyway.
 TEST(GstEnginePipelineTest, PauseDuringDeviceWarmupHoldsPlayback) {

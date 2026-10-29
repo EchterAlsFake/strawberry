@@ -96,6 +96,7 @@ constexpr int GST_PLAY_FLAG_TEXT = 0x00000004;
 constexpr int GST_PLAY_FLAG_DOWNLOAD = 0x00000080;
 constexpr int GST_PLAY_FLAG_BUFFERING = 0x00000100;
 constexpr int GST_PLAY_FLAG_SOFT_VOLUME = 0x00000010;
+constexpr int GST_PLAY_FLAG_NATIVE_AUDIO = 0x00000020;
 
 constexpr int kGstStateTimeoutNanosecs = 10000000;
 constexpr std::chrono::milliseconds kFaderFudgeMsec = 2000ms;
@@ -139,6 +140,9 @@ GstEnginePipeline::GstEnginePipeline(QObject *parent)
       playbin3_enabled_(true),
       exclusive_mode_(false),
       volume_enabled_(true),
+      bit_perfect_(BackendSettings::kDefaultBitPerfect),
+      native_dsd_enabled_(BackendSettings::kDefaultNativeDSD),
+      native_dsd_(false),
       volume_exponential_(false),
       fading_enabled_(false),
       strict_ssl_enabled_(false),
@@ -204,6 +208,7 @@ GstEnginePipeline::GstEnginePipeline(QObject *parent)
       audiobin_(nullptr),
       audiosink_(nullptr),
       audioqueue_(nullptr),
+      direct_capsfilter_(nullptr),
       volume_(nullptr),
       volume_sw_(nullptr),
       volume_fading_(nullptr),
@@ -476,6 +481,11 @@ void GstEnginePipeline::DisconnectCallbacks() {
       element_added_cb_id_.reset();
     }
 
+    if (dsd_element_added_cb_id_.has_value()) {
+      g_signal_handler_disconnect(G_OBJECT(pipeline_), dsd_element_added_cb_id_.value());
+      dsd_element_added_cb_id_.reset();
+    }
+
     if (element_removed_cb_id_.has_value()) {
       g_signal_handler_disconnect(G_OBJECT(audiobin_), element_removed_cb_id_.value());
       element_removed_cb_id_.reset();
@@ -583,10 +593,48 @@ bool GstEnginePipeline::InitFromUrl(const QUrl &media_url, const QUrl &stream_ur
 
   ebur128_loudness_normalizing_gain_db_ = ebur128_loudness_normalizing_gain_db;
 
+  if (bit_perfect_ && (output_ != QLatin1String(GstEngine::kALSASink) || !device_.toString().startsWith("hw:"_L1))) {
+    error = tr("Bit-perfect output requires ALSA output and a direct hw: device (for example hw:CARD=Pro,DEV=0).");
+    return false;
+  }
+
+  native_dsd_ = UsesNativeDsd(stream_url);
+  if (native_dsd_ || bit_perfect_) {
+    // These paths must never create any of the PCM processing or volume elements.
+    volume_enabled_ = false;
+    fading_enabled_ = false;
+    exclusive_mode_ = true;
+  }
+
   const QString playbin_name = playbin3_support_ && playbin3_enabled_ ? u"playbin3"_s : u"playbin"_s;
   qLog(Debug) << "Using" << playbin_name << "for pipeline";
   pipeline_ = CreateElement(playbin_name, u"pipeline"_s, nullptr, error);
   if (!pipeline_) return false;
+
+  if (native_dsd_) {
+    // playbin3 creates uridecodebin3 during construction; playbin creates its decoders later.
+    // Configure existing and future decoders so decoding stops at DSD, before libav converts it to PCM.
+    dsd_element_added_cb_id_ = CHECKED_GCONNECT(G_OBJECT(pipeline_), "deep-element-added", &DsdElementAddedCallback, this);
+    GstIterator *iterator = gst_bin_iterate_recurse(GST_BIN(pipeline_));
+    GValue item = G_VALUE_INIT;
+    bool done = false;
+    while (!done) {
+      switch (gst_iterator_next(iterator, &item)) {
+        case GST_ITERATOR_OK:
+          DsdElementAddedCallback(nullptr, nullptr, GST_ELEMENT(g_value_get_object(&item)), this);
+          g_value_reset(&item);
+          break;
+        case GST_ITERATOR_RESYNC:
+          gst_iterator_resync(iterator);
+          break;
+        default:
+          done = true;
+          break;
+      }
+    }
+    if (G_IS_VALUE(&item)) g_value_unset(&item);
+    gst_iterator_free(iterator);
+  }
 
   pad_added_cb_id_ = CHECKED_GCONNECT(G_OBJECT(pipeline_), "pad-added", &PadAddedCallback, this);
   notify_source_cb_id_ = CHECKED_GCONNECT(G_OBJECT(pipeline_), "source-setup", &SourceSetupCallback, this);
@@ -620,6 +668,7 @@ bool GstEnginePipeline::InitFromUrl(const QUrl &media_url, const QUrl &stream_ur
   flags &= ~GST_PLAY_FLAG_VIDEO;
   flags &= ~GST_PLAY_FLAG_TEXT;
   flags &= ~GST_PLAY_FLAG_SOFT_VOLUME;
+  if (native_dsd_ || bit_perfect_) flags |= GST_PLAY_FLAG_NATIVE_AUDIO;
   g_object_set(G_OBJECT(pipeline_), "flags", flags, nullptr);
 
   {
@@ -756,11 +805,13 @@ bool GstEnginePipeline::InitAudioBin(QString &error) {
   }
 
 #ifndef Q_OS_WIN32
-  if (g_object_class_find_property(G_OBJECT_GET_CLASS(audiosink_), "volume")) {
+  if (!native_dsd_ && !bit_perfect_ && g_object_class_find_property(G_OBJECT_GET_CLASS(audiosink_), "volume")) {
     qLog(Debug) << output_ << "has volume, enabling volume synchronization.";
     SetupVolume(audiosink_);
   }
 #endif
+
+  if (native_dsd_ || bit_perfect_) return InitDirectAudioBin(error);
 
   // Create all the other elements
 
@@ -1072,6 +1123,135 @@ bool GstEnginePipeline::InitAudioBin(QString &error) {
   logged_unsupported_analyzer_format_ = false;
 
   return true;
+
+}
+
+bool GstEnginePipeline::UsesNativeDsd(const QUrl &url) const {
+
+  return native_dsd_enabled_ && output_ == QLatin1String(GstEngine::kALSASink) &&
+         device_.toString().startsWith("hw:"_L1) && url.path().endsWith(".dsf"_L1, Qt::CaseInsensitive);
+
+}
+
+void GstEnginePipeline::DsdElementAddedCallback(GstBin *bin, GstBin *sub_bin, GstElement *element, gpointer self) {
+
+  Q_UNUSED(bin)
+  Q_UNUSED(sub_bin)
+  Q_UNUSED(self)
+
+  GstElementFactory *factory = gst_element_get_factory(element);
+  if (!factory) return;
+  const QByteArray name(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)));
+  if (name != "uridecodebin" && name != "uridecodebin3" && name != "decodebin" && name != "decodebin3") return;
+
+  GstCaps *caps = gst_caps_new_empty_simple("audio/x-dsd");
+  g_object_set(G_OBJECT(element), "caps", caps, nullptr);
+  gst_caps_unref(caps);
+
+}
+
+bool GstEnginePipeline::InitDirectAudioBin(QString &error) {
+
+  if (native_dsd_) {
+    GstPad *pad = gst_element_get_static_pad(audiosink_, "sink");
+    GstCaps *sink_caps = pad ? gst_pad_get_pad_template_caps(pad) : nullptr;
+    GstCaps *dsd_caps = gst_caps_new_empty_simple("audio/x-dsd");
+    const bool supports_dsd = sink_caps && gst_caps_can_intersect(sink_caps, dsd_caps);
+    gst_caps_unref(dsd_caps);
+    if (sink_caps) gst_caps_unref(sink_caps);
+    if (pad) gst_object_unref(pad);
+    if (!supports_dsd) {
+      error = tr("This GStreamer ALSA plugin does not support native DSD. Install GStreamer with DSD support, or disable automatic native DSD to decode DSF to PCM.");
+      return false;
+    }
+  }
+
+  audioqueue_ = CreateElement(u"queue2"_s, u"audioqueue"_s, audiobin_, error);
+  GstElement *converter = CreateElement(native_dsd_ ? u"dsdconvert"_s : u"audioconvert"_s, u"directconverter"_s, audiobin_, error);
+  direct_capsfilter_ = CreateElement(u"capsfilter"_s, u"directcaps"_s, audiobin_, error);
+  if (!audioqueue_ || !converter || !direct_capsfilter_) return false;
+
+  if (!native_dsd_) {
+    g_object_set(G_OBJECT(converter), "dithering", GST_AUDIO_DITHER_NONE, "noise-shaping", GST_AUDIO_NOISE_SHAPING_NONE, nullptr);
+  }
+  GstCaps *caps = gst_caps_from_string(native_dsd_ ? "audio/x-dsd,layout=interleaved,reversed-bytes=false" : "audio/x-raw,layout=interleaved");
+  g_object_set(G_OBJECT(direct_capsfilter_), "caps", caps, nullptr);
+  gst_caps_unref(caps);
+
+  if (!gst_element_link_many(audioqueue_, converter, direct_capsfilter_, audiosink_, nullptr)) {
+    error = tr("Failed to link the direct audio output pipeline.");
+    return false;
+  }
+
+  GstPad *sink_pad = gst_element_get_static_pad(audioqueue_, "sink");
+  gst_element_add_pad(audiobin_, gst_ghost_pad_new("sink", sink_pad));
+  gst_object_unref(sink_pad);
+
+  eventprobe_ = audioqueue_;
+  bufferprobe_ = audioqueue_;
+  GstPad *src_pad = gst_element_get_static_pad(audioqueue_, "src");
+  upstream_events_probe_cb_id_ = gst_pad_add_probe(src_pad, GST_PAD_PROBE_TYPE_EVENT_UPSTREAM, UpstreamEventsProbeCallback, this, nullptr);
+  buffer_probe_cb_id_ = gst_pad_add_probe(src_pad, static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM | GST_PAD_PROBE_TYPE_BUFFER), DirectAudioProbeCallback, this, nullptr);
+  gst_object_unref(src_pad);
+
+  g_object_set(G_OBJECT(audioqueue_), "use-buffering", TRUE,
+               "low-watermark", buffer_low_watermark_, "high-watermark", buffer_high_watermark_, nullptr);
+  if (buffer_duration_nanosec_ > 0) {
+    g_object_set(G_OBJECT(audioqueue_), "max-size-buffers", 0, "max-size-bytes", 0, "max-size-time", buffer_duration_nanosec_, nullptr);
+  }
+
+  // Avoid clock-drift compensation changing the samples sent to a hardware DAC.
+  gst_util_set_object_arg(G_OBJECT(audiosink_), "slave-method", "none");
+
+  GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline_));
+  gst_bus_set_sync_handler(bus, BusSyncCallback, this, nullptr);
+  gst_bus_add_watch(bus, BusWatchCallback, this);
+  gst_object_unref(bus);
+
+  qLog(Info) << (native_dsd_ ? "Native DSD output to" : "Bit-perfect PCM output to") << device_;
+  return true;
+
+}
+
+GstPadProbeReturn GstEnginePipeline::DirectAudioProbeCallback(GstPad *pad, GstPadProbeInfo *info, gpointer self) {
+
+  GstEnginePipeline *instance = reinterpret_cast<GstEnginePipeline*>(self);
+  if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) return BufferProbeCallback(pad, info, self);
+  GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+  if (instance->native_dsd_ || GST_EVENT_TYPE(event) != GST_EVENT_CAPS) return GST_PAD_PROBE_OK;
+
+  GstCaps *input_caps = nullptr;
+  gst_event_parse_caps(event, &input_caps);
+  GstAudioInfo audio_info;
+  gst_audio_info_init(&audio_info);
+  if (!gst_audio_info_from_caps(&audio_info, input_caps)) return GST_PAD_PROBE_OK;
+
+  // Preserve rate, channels and channel positions, allowing only lossless integer widening/packing.
+  // Floating point decoder output may also be quantized to an integer DAC format of at least the same depth.
+  GstCaps *output_caps = gst_caps_copy(input_caps);
+  GstStructure *structure = gst_caps_get_structure(output_caps, 0);
+  gst_structure_set(structure, "layout", G_TYPE_STRING, "interleaved", nullptr);
+  GValue formats = G_VALUE_INIT;
+  g_value_init(&formats, GST_TYPE_LIST);
+  GstPad *converter_pad = gst_element_get_static_pad(instance->direct_capsfilter_, "sink");
+  GstPad *peer = gst_pad_get_peer(converter_pad);
+  GstCaps *template_caps = gst_pad_get_pad_template_caps(peer);
+  const GValue *available_formats = gst_structure_get_value(gst_caps_get_structure(template_caps, 0), "format");
+  for (guint i = 0; i < gst_value_list_get_size(available_formats); ++i) {
+    const GValue *format = gst_value_list_get_value(available_formats, i);
+    const GstAudioFormatInfo *format_info = gst_audio_format_get_info(gst_audio_format_from_string(g_value_get_string(format)));
+    if (GST_AUDIO_FORMAT_INFO_DEPTH(format_info) < GST_AUDIO_INFO_DEPTH(&audio_info)) continue;
+    if (GST_AUDIO_FORMAT_INFO_IS_INTEGER(audio_info.finfo) && !GST_AUDIO_FORMAT_INFO_IS_INTEGER(format_info)) continue;
+    gst_value_list_append_value(&formats, format);
+  }
+  gst_structure_set_value(structure, "format", &formats);
+  g_value_unset(&formats);
+  gst_caps_unref(template_caps);
+  gst_object_unref(peer);
+  gst_object_unref(converter_pad);
+  g_object_set(G_OBJECT(instance->direct_capsfilter_), "caps", output_caps, nullptr);
+  gst_caps_unref(output_caps);
+  return GST_PAD_PROBE_OK;
 
 }
 
@@ -1542,7 +1722,10 @@ GstPadProbeReturn GstEnginePipeline::BufferProbeCallback(GstPad *pad, GstPadProb
     }
   }
 
-  if (channels <= 0 || rate <= 0) {
+  if (instance->native_dsd_) {
+    // DSD bits are not PCM samples and must never be handed to PCM visualizers.
+  }
+  else if (channels <= 0 || rate <= 0) {
     // Missing/invalid caps (e.g. the pad hasn't negotiated yet, or malformed stream metadata): channels is used as a divisor below in every branch, and rate as a divisor inside GST_FRAMES_TO_CLOCK_TIME, so bail out here rather than risk a division by zero or a nonsense duration in every branch below.
     if (!instance->logged_unsupported_analyzer_format_) {
       instance->logged_unsupported_analyzer_format_ = true;
@@ -1638,7 +1821,7 @@ GstPadProbeReturn GstEnginePipeline::BufferProbeCallback(GstPad *pad, GstPadProb
   }
 
   QList<GstBufferConsumer*> consumers;
-  {
+  if (!instance->native_dsd_) {
     QMutexLocker l(&instance->mutex_buffer_consumers_);
     consumers = instance->buffer_consumers_;
   }
@@ -1955,6 +2138,12 @@ void GstEnginePipeline::ErrorMessageReceived(GstMessage *msg) {
 
   qLog(Error) << __FUNCTION__ << "ID:" << id() << "Domain:" << domain << "Code:" << code << "Error:" << message;
   qLog(Error) << __FUNCTION__ << "ID:" << id() << "Domain:" << domain << "Code:" << code << "Debug:" << debugstr;
+
+  if ((native_dsd_ || bit_perfect_) && debugstr.contains("not-negotiated"_L1)) {
+    message = native_dsd_
+                  ? tr("The selected ALSA device could not negotiate this track's native DSD format. Check the DAC's supported DSD rates, or disable automatic native DSD to decode to PCM.")
+                  : tr("The selected ALSA device could not play this track at its original sample rate, channel count and PCM precision. Bit-perfect output does not resample, mix channels or reduce integer precision.");
+  }
 
 #ifdef HAVE_SPOTIFY
   // The Spotify plugin only reports "Resource not found." with "track is not available" in the debug message, which doesn't tell the user why.
@@ -3066,6 +3255,21 @@ bool GstEnginePipeline::HasMatchingNextUrl() const {
 
 void GstEnginePipeline::PrepareNextUrl(const QUrl &media_url, const QUrl &stream_url, const QByteArray &gst_url, const qint64 beginning_offset_nanosec, const qint64 end_offset_nanosec) {
 
+  // A PCM/DSD boundary needs a fresh audio bin and must release the exclusive device first.
+  if (UsesNativeDsd(stream_url) != native_dsd_) {
+    QMutexLocker l(&mutex_next_url_);
+    // Discard an earlier preload candidate if a playlist edit now puts a format boundary here.
+    // An already committed URI belongs to the active gapless transition and must remain intact.
+    if (!next_uri_set_.load()) {
+      next_media_url_.clear();
+      next_stream_url_.clear();
+      next_gst_url_.clear();
+      next_beginning_offset_nanosec_ = 0;
+      next_end_offset_nanosec_ = 0;
+    }
+    return;
+  }
+
   {
     QMutexLocker l(&mutex_next_url_);
     next_media_url_ = media_url;
@@ -3083,7 +3287,10 @@ void GstEnginePipeline::PrepareNextUrl(const QUrl &media_url, const QUrl &stream
 // Self-guarding: returns immediately unless we're inside an about-to-finish window with a valid next URL queued, and atomically claims the next-URI slot via compare_exchange so concurrent callers can't double-set.
 void GstEnginePipeline::SetNextUrl() {
 
-  if (!about_to_finish_.load() || !HasNextUrl()) return;
+  if (!about_to_finish_.load()) return;
+
+  QMutexLocker l(&mutex_next_url_);
+  if (!next_stream_url_.isValid()) return;
 
   bool expected = false;
   if (!next_uri_set_.compare_exchange_strong(expected, true)) return;
@@ -3093,14 +3300,11 @@ void GstEnginePipeline::SetNextUrl() {
 
   // Set the next uri. When the current song ends it will be played automatically and a STREAM_START message is send to the bus.
   // When the next uri is not playable an error message is send when the pipeline goes to PLAY (or PAUSE) state or immediately if it is currently in PLAY state.
-  {
-    QMutexLocker l(&mutex_next_url_);
-    // The transition happens when the current stream ends, so keep ignoring volume and mute changes until the next stream started.
-    // This is set before the next URL, since the stream start or an error for it can clear it as soon as it is set, which setting this after would undo.
-    gapless_transition_ = true;
-    qLog(Debug) << "Setting next URL to" << Utilities::UrlForLog(next_gst_url_);
-    g_object_set(G_OBJECT(pipeline_), "uri", next_gst_url_.constData(), nullptr);
-  }
+  // The transition happens when the current stream ends, so keep ignoring volume and mute changes until the next stream started.
+  // This is set before the next URL, since the stream start or an error for it can clear it as soon as it is set, which setting this after would undo.
+  gapless_transition_ = true;
+  qLog(Debug) << "Setting next URL to" << Utilities::UrlForLog(next_gst_url_);
+  g_object_set(G_OBJECT(pipeline_), "uri", next_gst_url_.constData(), nullptr);
   about_to_finish_ = false;
 
 }
