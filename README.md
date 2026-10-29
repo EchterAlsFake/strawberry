@@ -1,3 +1,13 @@
+# Vibe Code Warning
+Guys, I know absolutely nothing about C++, except for when I wanted to make an Aimbot when I was 12 and copied some stuff from YouTube videos lol. 
+However, Strawberry is my favorite music player, but it's missing some features I specficially want to use. Therefore I decided to vibe code these in.
+I'll tell you the additonal features down below, once I have implemented them, but I explicitly want to clarify that this project is not intended for public usage,
+as I can not guarantee any code safety. 
+
+Additionally I will not try on merging those changes into the official project, as again, this is entirely vibe coded and I do not open Pull Requests with Code I don't understand, as that would be disrespectful in my opinion. 
+
+
+
 # :strawberry: Strawberry Music Player [![Build Status](https://github.com/strawberrymusicplayer/strawberry/actions/workflows/build.yaml/badge.svg?branch=master)](https://github.com/strawberrymusicplayer/strawberry/actions)
 [![Sponsor](https://img.shields.io/badge/-Sponsor-green?logo=github)](https://github.com/sponsors/jonaski)
 [![Patreon](https://img.shields.io/badge/patreon-donate-green.svg)](https://patreon.com/jonaskvinge)
