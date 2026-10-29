@@ -6,6 +6,15 @@ as I can not guarantee any code safety.
 
 Additionally I will not try on merging those changes into the official project, as again, this is entirely vibe coded and I do not open Pull Requests with Code I don't understand, as that would be disrespectful in my opinion. 
 
+# Additional Features
+- Native DSD Support
+- Alsa Bit Perfect Support
+
+
+
+# Notice
+- DSD was tested on a Topping DX3 Pro+ running the newest Linux kernel on Arch Linux
+- If your device has an XMOS chip, there's a high chance it works too :) 
 
 
 # :strawberry: Strawberry Music Player [![Build Status](https://github.com/strawberrymusicplayer/strawberry/actions/workflows/build.yaml/badge.svg?branch=master)](https://github.com/strawberrymusicplayer/strawberry/actions)
