@@ -455,14 +455,14 @@
         <item row="3" column="0">
          <widget class="QLabel" name="label_device_warmup">
           <property name="text">
-           <string>Device warm-up</string>
+           <string>DAC settling delay</string>
           </property>
          </widget>
         </item>
         <item row="3" column="1">
          <widget class="QSpinBox" name="spinbox_device_warmup">
           <property name="toolTip">
-           <string>Delay between opening the audio device and starting playback, to avoid the start of the track being cut off while the device (DAC) is still becoming ready.  Set to 0 to disable.</string>
+           <string>Wait after opening and configuring the audio device before playing the track. With direct or exclusive hardware output, this delay applies to each new file so the DAC can settle after a sample-rate or PCM/DSD change. Try 300–500 ms. A nonzero delay disables gapless transitions between files on exclusive outputs; consecutive CUE sections of the same file stay continuous. Set to 0 to disable the delay and allow gapless playback.</string>
           </property>
           <property name="suffix">
            <string> ms</string>

@@ -43,7 +43,9 @@
 #include <QDataStream>
 
 #include "engine/gststartup.h"
+#include "engine/gstengine.h"
 #include "engine/gstenginepipeline.h"
+#include "core/taskmanager.h"
 
 #include "test_utils.h"
 
@@ -52,6 +54,17 @@ using namespace Qt::Literals::StringLiterals;
 // Declared at file scope so that GstEnginePipeline's "friend class GstEnginePipelineTest;" resolves to this class.
 class GstEnginePipelineTest {
  public:
+  static void ConfigureHardwareOutput(GstEngine &engine, const int delay_ms) {
+    engine.output_ = u"alsasink"_s;
+    engine.device_ = u"hw:Pro,0"_s;
+    engine.bit_perfect_ = true;
+    engine.device_warmup_duration_ms_ = delay_ms;
+  }
+
+  static GstEnginePipelinePtr CurrentPipeline(const GstEngine &engine) { return engine.current_pipeline_; }
+
+  static bool WarmupWaiting(const GstEnginePipeline &pipeline) { return pipeline.device_warmup_waiting_.load(); }
+
   static bool IsNativeDsd(const GstEnginePipeline &pipeline) { return pipeline.native_dsd_; }
 
   static bool HasProcessing(const GstEnginePipeline &pipeline) {
@@ -422,6 +435,82 @@ TEST(GstEnginePipelineTest, DisablingNativeDsdStillPlaysDsfAsPcm) {
   ASSERT_TRUE(WaitFor([&]() { return ended || !error.isEmpty(); }));
   ASSERT_TRUE(error.isEmpty()) << error.toStdString();
   EXPECT_FALSE(CapturedAudio(sink).isEmpty());
+
+}
+
+TEST(GstEnginePipelineTest, DacSettlingDelayAppliesOnInitialManualAndAutomaticStarts) {
+
+  GstStartup::Initialize();
+  TemporaryResource first(u":/audio/strawberry.wav"_s);
+  TemporaryResource second(u":/audio/strawberry.wav"_s);
+  ASSERT_TRUE(first.open());
+  ASSERT_TRUE(second.open());
+  const QUrl first_url = QUrl::fromLocalFile(first.fileName());
+  const QUrl second_url = QUrl::fromLocalFile(second.fileName());
+
+  GstEngine engine(SharedPtr<TaskManager>(new TaskManager));
+  constexpr int delay_ms = 300;
+  GstEnginePipelineTest::ConfigureHardwareOutput(engine, delay_ms);
+  QString error;
+  QObject::connect(&engine, &EngineBase::Error, &engine, [&error](const QString &message) { error = message; });
+
+  for (const auto change : {EngineBase::TrackChangeType::First, EngineBase::TrackChangeType::Manual, EngineBase::TrackChangeType::Auto}) {
+    SCOPED_TRACE(static_cast<int>(change));
+    const QUrl url = change == EngineBase::TrackChangeType::Manual ? second_url : first_url;
+    ASSERT_TRUE(engine.Load(url, url, change, false, 0, 0, std::nullopt)) << error.toStdString();
+    const GstEnginePipelinePtr pipeline = GstEnginePipelineTest::CurrentPipeline(engine);
+    ASSERT_NE(nullptr, pipeline);
+    GstElement *sink = GstEnginePipelineTest::CaptureOutput(*pipeline, "audio/x-raw");
+    ASSERT_NE(nullptr, sink);
+    g_object_set(G_OBJECT(sink), "sync", TRUE, nullptr);
+
+    QElapsedTimer timer;
+    timer.start();
+    ASSERT_TRUE(engine.Play(false, 0));
+    ASSERT_TRUE(WaitFor([&]() { return GstEnginePipelineTest::WarmupWaiting(*pipeline) || pipeline->state() == GST_STATE_PLAYING || !error.isEmpty(); }));
+    ASSERT_TRUE(error.isEmpty()) << error.toStdString();
+    ASSERT_TRUE(GstEnginePipelineTest::WarmupWaiting(*pipeline)) << "The new track skipped the DAC settling delay";
+    ProcessEventsFor(100);
+    EXPECT_EQ(GST_STATE_PAUSED, pipeline->state());
+    EXPECT_EQ(nullptr, gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 0));
+    EXPECT_TRUE(engine.state() == EngineBase::State::Playing);
+
+    ASSERT_TRUE(WaitFor([&]() { return pipeline->state() == GST_STATE_PLAYING || !error.isEmpty(); }));
+    ASSERT_TRUE(error.isEmpty()) << error.toStdString();
+    EXPECT_GE(timer.elapsed(), delay_ms);
+    GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), GST_SECOND);
+    ASSERT_NE(nullptr, sample);
+    EXPECT_EQ(GstClockTime(0), GST_BUFFER_PTS(gst_sample_get_buffer(sample))) << "The opening audio was skipped";
+    gst_sample_unref(sample);
+
+    const QUrl next_url = url == first_url ? second_url : first_url;
+    engine.StartPreloading(next_url, next_url, false, 0, 0);
+    EXPECT_FALSE(pipeline->HasNextUrl()) << "Gapless preloading would bypass the settling delay";
+  }
+  engine.Stop(false);
+
+}
+
+TEST(GstEnginePipelineTest, ZeroDacSettlingDelayPreservesGaplessPreloading) {
+
+  GstStartup::Initialize();
+  const QUrl first = QUrl::fromLocalFile(u"/tmp/first.flac"_s);
+  const QUrl next = QUrl::fromLocalFile(u"/tmp/next.flac"_s);
+  for (const int delay_ms : {0, 500}) {
+    GstEnginePipeline pipeline;
+    pipeline.set_output_device(u"alsasink"_s, u"hw:Pro,0"_s);
+    pipeline.set_bit_perfect(true);
+    pipeline.set_device_warmup_duration_ms(delay_ms);
+    QString error;
+    ASSERT_TRUE(pipeline.InitFromUrl(first, first, first.toEncoded(), 0, 0, 0.0, error)) << error.toStdString();
+    pipeline.PrepareNextUrl(next, next, next.toEncoded(), 0, 0);
+    EXPECT_EQ(delay_ms == 0, pipeline.HasNextUrl());
+    // CUE sections in a single file never need to switch the hardware format.
+    pipeline.PrepareNextUrl(first, first, first.toEncoded(), 1000000000, 2000000000);
+    EXPECT_TRUE(pipeline.HasMatchingNextUrl());
+    pipeline.PrepareNextUrl(next, next, next.toEncoded(), 0, 0);
+    EXPECT_EQ(delay_ms == 0, pipeline.HasNextUrl());
+  }
 
 }
 

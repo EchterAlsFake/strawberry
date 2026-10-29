@@ -2688,7 +2688,7 @@ void GstEnginePipeline::StartPlaybackAfterWarmup() {
     qLog(Debug) << "Waiting" << device_warmup_duration_ms_ << "ms for the audio device to warm up before playing";
     const quint64 device_warmup_generation = device_warmup_generation_.load();
     device_warmup_waiting_ = true;
-    QTimer::singleShot(device_warmup_duration_ms_, this, [this, device_warmup_generation]() { DeviceWarmupElapsed(device_warmup_generation); });
+    QTimer::singleShot(device_warmup_duration_ms_, Qt::PreciseTimer, this, [this, device_warmup_generation]() { DeviceWarmupElapsed(device_warmup_generation); });
   }
   else {
     SetStateAsync(GST_STATE_PLAYING);
@@ -3255,10 +3255,17 @@ bool GstEnginePipeline::HasMatchingNextUrl() const {
 
 void GstEnginePipeline::PrepareNextUrl(const QUrl &media_url, const QUrl &stream_url, const QByteArray &gst_url, const qint64 beginning_offset_nanosec, const qint64 end_offset_nanosec) {
 
-  // A PCM/DSD boundary needs a fresh audio bin and must release the exclusive device first.
-  if (UsesNativeDsd(stream_url) != native_dsd_) {
+  bool needs_device_warmup = false;
+  {
+    QMutexLocker l(&mutex_url_);
+    // Preroll configures the DAC before the settling timer starts. An in-place gapless transition
+    // skips that timer, so use a new pipeline between files when an exclusive device needs a delay.
+    // Consecutive CUE sections of the same file keep playing without reopening the device.
+    needs_device_warmup = exclusive_mode_ && device_warmup_duration_ms_ > 0 && stream_url != stream_url_;
+  }
+  if (UsesNativeDsd(stream_url) != native_dsd_ || needs_device_warmup) {
     QMutexLocker l(&mutex_next_url_);
-    // Discard an earlier preload candidate if a playlist edit now puts a format boundary here.
+    // Discard an earlier preload candidate if this transition now needs a fresh pipeline.
     // An already committed URI belongs to the active gapless transition and must remain intact.
     if (!next_uri_set_.load()) {
       next_media_url_.clear();

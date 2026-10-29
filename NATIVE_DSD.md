@@ -31,10 +31,19 @@ the DAC; it does not convert DSD to PCM. Native DSD always bypasses audio
 processing and software volume, independently of the bit-perfect PCM option.
 Ordinary tracks remain PCM. Both playbin and playbin3 are supported.
 
-Switching between PCM and native DSD creates a fresh pipeline and waits for
-the previous pipeline to release the device. These boundaries are not gapless.
-The existing gapless mechanism remains available between tracks on the same
-path. Spectrum visualizers do not receive native DSD buffers.
+**DAC settling delay** in **Settings → Backend → Buffer** controls the wait
+between configuring the audio device and starting the track. The default is
+500 ms; try 300–500 ms for the DX3 Pro+. Playback prerolls with the selected
+sample rate and PCM/DSD format, then holds the track paused until this delay
+elapses. The opening notes are retained and audio samples are unchanged.
+
+With direct/exclusive hardware output and a nonzero delay, each new file uses
+a fresh pipeline, waits for the previous pipeline to release the device, and
+applies the settling delay. This also covers manual skips, automatic advances
+and PCM/DSD switches. Consecutive CUE sections of the same file stay continuous.
+Set the delay to 0 to allow gapless playback between tracks on the same path.
+PCM/DSD boundaries always need separate pipelines. Spectrum visualizers do not
+receive native DSD buffers.
 
 Native routing currently recognizes `.dsf` URL paths (case-insensitively).
 DSDIFF/DFF and extensionless DSD URLs retain the existing decoding behavior.
