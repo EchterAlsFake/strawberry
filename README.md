@@ -9,6 +9,7 @@ Additionally I will not try on merging those changes into the official project, 
 # Additional Features
 - Native DSD Support
 - Alsa Bit Perfect Support
+- Buffer Delay for DAC that is applied globally
 
 
 
